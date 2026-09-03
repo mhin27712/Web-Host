@@ -1,0 +1,15 @@
+{
+  "name": "tm-web-hosting",
+  "version": "4.0.0",
+  "description": "TM Web Hosting - Static Website Hosting Platform",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "express": "^5.1.0",
+    "fs-extra": "^11.3.0",
+    "multer": "^2.0.2"
+  }
+}
