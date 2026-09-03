@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <title>Dashboard - TM Web Hosting</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #f5f7fb;
+      color: #222;
+    }
+
+    header {
+      background: white;
+      border-bottom: 1px solid #ddd;
+      padding: 15px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 15px;
+    }
+
+    .user {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .user img {
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+    }
+
+    button {
+      border: 0;
+      padding: 11px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      background: #111;
+      color: white;
+    }
+
+    .container {
+      max-width: 1100px;
+      margin: 30px auto;
+      padding: 0 20px;
+    }
+
+    .box {
+      background: white;
+      padding: 25px;
+      margin-bottom: 25px;
+      border-radius: 14px;
+      box-shadow: 0 5px 20px rgba(0,0,0,.05);
+    }
+
+    input,
+    textarea {
+      width: 100%;
+      padding: 12px;
+      margin-top: 8px;
+      margin-bottom: 15px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      font: inherit;
+    }
+
+    textarea {
+      min-height: 300px;
+      resize: vertical;
+      font-family: monospace;
+    }
+
+    .website {
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      padding: 18px;
+      margin-top: 15px;
+    }
+
+    .website-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .delete {
+      background: #d32f2f;
+    }
+
+    .success {
+      padding: 12px;
+      background: #e8f5e9;
+      color: #2e7d32;
+      border-radius: 8px;
+      display: none;
+      margin-bottom: 15px;
+    }
+
+    .error {
+      padding: 12px;
+      background: #ffebee;
+      color: #c62828;
+      border-radius: 8px;
+      display: none;
+      margin-bottom: 15px;
+    }
+
+    a {
+      color: #1565c0;
+      word-break: break-all;
+    }
+
+    @media (max-width: 600px) {
+      header {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .container {
+        margin-top: 20px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+<header>
+
+  <strong>TM Web Hosting</strong>
+
+  <div class="user">
+    <img id="userPicture" src="" alt="User">
+
+    <span id="userName">Loading...</span>
+
+    <button onclick="logout()">
+      Logout
+    </button>
+  </div>
+
+</header>
+
+<div class="container">
+
+  <div class="box">
+
+    <h2>Create HTML Website</h2>
+
+    <div id="htmlSuccess" class="success"></div>
+    <div id="htmlError" class="error"></div>
+
+    <label>
+      Website name
+    </label>
+
+    <input
+      id="htmlName"
+      type="text"
+      placeholder="My Website"
+    >
+
+    <label>
+      HTML code
+    </label>
+
+    <textarea
+      id="htmlCode"
+      placeholder="<!DOCTYPE html>
+<html>
+<head>
+<title>My Website</title>
+</head>
+<body>
+<h1>Hello World</h1>
+</body>
+</html>"
+    ></textarea>
+
+    <button onclick="createHTMLWebsite()">
+      Create Website
+    </button>
+
+  </div>
+
+
+  <div class="box">
+
+    <h2>Upload ZIP Website</h2>
+
+    <div id="zipSuccess" class="success"></div>
+    <div id="zipError" class="error"></div>
+
+    <label>
+      Website name
+    </label>
+
+    <input
+      id="zipName"
+      type="text"
+      placeholder="My ZIP Website"
+    >
+
+    <label>
+      ZIP file
+    </label>
+
+    <input
+      id="zipFile"
+      type="file"
+      accept=".zip"
+    >
+
+    <p>
+      ZIP file-এর ভিতরে অবশ্যই
+      <strong>index.html</strong>
+      থাকতে হবে।
+    </p>
+
+    <button onclick="uploadZIP()">
+      Upload ZIP
+    </button>
+
+  </div>
+
+
+  <div class="box">
+
+    <h2>My Websites</h2>
+
+    <div id="websites">
+      Loading...
+    </div>
+
+  </div>
+
+</div>
+
+
+<script>
+
+async function loadUser() {
+
+  const response = await fetch("/api/me");
+
+  if (!response.ok) {
+    window.location.href = "/";
+    return;
+  }
+
+  const user = await response.json();
+
+  document.getElementById("userName").textContent =
+    user.name || user.email;
+
+  if (user.picture) {
+    document.getElementById("userPicture").src =
+      user.picture;
+  }
+}
+
+
+async function loadWebsites() {
+
+  const response = await fetch("/api/websites");
+
+  if (!response.ok) {
+    window.location.href = "/";
+    return;
+  }
+
+  const websites = await response.json();
+
+  const container =
+    document.getElementById("websites");
+
+  container.innerHTML = "";
+
+  if (websites.length === 0) {
+
+    container.innerHTML =
+      "<p>You have not created any websites yet.</p>";
+
+    return;
+  }
+
+  websites.forEach(site => {
+
+    const div =
+      document.createElement("div");
+
+    div.className = "website";
+
+    const title =
+      document.createElement("h3");
+
+    title.textContent = site.name;
+
+    const type =
+      document.createElement("p");
+
+    type.textContent =
+      "Type: " + site.type;
+
+    const link =
+      document.createElement("a");
+
+    link.href =
+      "/site/" + encodeURIComponent(site.slug);
+
+    link.target = "_blank";
+
+    link.textContent =
+      window.location.origin +
+      "/site/" +
+      site.slug;
+
+    const actions =
+      document.createElement("div");
+
+    actions.className =
+      "website-actions";
+
+    const openButton =
+      document.createElement("button");
+
+    openButton.textContent =
+      "Open Website";
+
+    openButton.onclick = () => {
+      window.open(
+        "/site/" +
+        encodeURIComponent(site.slug),
+        "_blank"
+      );
+    };
+
+    const deleteButton =
+      document.createElement("button");
+
+    deleteButton.textContent =
+      "Delete";
+
+    deleteButton.className =
+      "delete";
+
+    deleteButton.onclick = () => {
+      deleteWebsite(site.id);
+    };
+
+    actions.appendChild(openButton);
+    actions.appendChild(deleteButton);
+
+    div.appendChild(title);
+    div.appendChild(type);
+    div.appendChild(link);
+    div.appendChild(actions);
+
+    container.appendChild(div);
+
+  });
+}
+
+
+async function createHTMLWebsite() {
+
+  hideMessage("htmlSuccess");
+  hideMessage("htmlError");
+
+  const name =
+    document.getElementById("htmlName").value.trim();
+
+  const html =
+    document.getElementById("htmlCode").value;
+
+  if (!name || !html) {
+
+    showMessage(
+      "htmlError",
+      "Website name এবং HTML code দিন।"
+    );
+
+    return;
+  }
+
+  try {
+
+    const response = await fetch(
+      "/api/websites/html",
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type": "application/json"
+        },
+
+        body: JSON.stringify({
+          name,
+          html
+        })
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.error);
+    }
+
+    showMessage(
+      "htmlSuccess",
+      "Website তৈরি হয়েছে: " +
+      window.location.origin +
+      "/site/" +
+      data.website.slug
+    );
+
+    document.getElementById("htmlName").value = "";
+    document.getElementById("htmlCode").value = "";
+
+    loadWebsites();
+
+  } catch (error) {
+
+    showMessage(
+      "htmlError",
+      error.message
+    );
+
+  }
+}
+
+
+async function uploadZIP() {
+
+  hideMessage("zipSuccess");
+  hideMessage("zipError");
+
+  const name =
+    document.getElementById("zipName").value.trim();
+
+  const file =
+    document.getElementById("zipFile").files[0];
+
+  if (!name || !file) {
+
+    showMessage(
+      "zipError",
+      "Website name এবং ZIP file নির্বাচন করুন।"
+    );
+
+    return;
+  }
+
+  const formData =
+    new FormData();
+
+  formData.append("name", name);
+  formData.append("website", file);
+
+  try {
+
+    const response = await fetch(
+      "/api/websites/zip",
+      {
+        method: "POST",
+        body: formData
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.error);
+    }
+
+    showMessage(
+      "zipSuccess",
+      "ZIP website তৈরি হয়েছে: " +
+      window.location.origin +
+      "/site/" +
+      data.website.slug
+    );
+
+    document.getElementById("zipName").value = "";
+    document.getElementById("zipFile").value = "";
+
+    loadWebsites();
+
+  } catch (error) {
+
+    showMessage(
+      "zipError",
+      error.message
+    );
+
+  }
+}
+
+
+async function deleteWebsite(id) {
+
+  const confirmed =
+    confirm(
+      "আপনি কি সত্যিই এই website delete করতে চান?"
+    );
+
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+
+    const response = await fetch(
+      "/api/websites/" + id,
+      {
+        method: "DELETE"
+      }
+    );
+
+    const data =
+      await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.error);
+    }
+
+    loadWebsites();
+
+  } catch (error) {
+
+    alert(error.message);
+
+  }
+}
+
+
+async function logout() {
+
+  await fetch(
+    "/api/auth/logout",
+    {
+      method: "POST"
+    }
+  );
+
+  window.location.href = "/";
+}
+
+
+function showMessage(id, message) {
+
+  const element =
+    document.getElementById(id);
+
+  element.textContent = message;
+  element.style.display = "block";
+}
+
+
+function hideMessage(id) {
+
+  const element =
+    document.getElementById(id);
+
+  element.style.display = "none";
+}
+
+
+loadUser();
+loadWebsites();
+
+</script>
+
+</body>
+</html>
