@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>TM Web Hosting | Login</title>
+
+<style>
+*{
+  box-sizing:border-box;
+  margin:0;
+  padding:0;
+}
+
+body{
+  min-height:100vh;
+  background:
+    radial-gradient(circle at top,#15233d 0%,#080a0f 45%,#030407 100%);
+  color:#fff;
+  font-family:Arial,Helvetica,sans-serif;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:20px;
+}
+
+.login-box{
+  width:100%;
+  max-width:420px;
+  background:rgba(15,18,27,.92);
+  border:1px solid rgba(255,255,255,.08);
+  border-radius:24px;
+  padding:32px;
+  box-shadow:0 25px 80px rgba(0,0,0,.55);
+  backdrop-filter:blur(18px);
+}
+
+.logo{
+  width:72px;
+  height:72px;
+  border-radius:20px;
+  margin:0 auto 20px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  background:linear-gradient(135deg,#00e5ff,#7c4dff);
+  font-size:27px;
+  font-weight:900;
+  box-shadow:0 10px 35px rgba(0,229,255,.2);
+}
+
+h1{
+  text-align:center;
+  font-size:26px;
+  margin-bottom:8px;
+}
+
+.subtitle{
+  text-align:center;
+  color:#8991a5;
+  font-size:14px;
+  margin-bottom:28px;
+}
+
+label{
+  display:block;
+  margin-bottom:8px;
+  color:#c8cedc;
+  font-size:13px;
+}
+
+input{
+  width:100%;
+  padding:15px;
+  border-radius:13px;
+  border:1px solid #252b38;
+  background:#0a0d13;
+  color:#fff;
+  outline:none;
+  font-size:15px;
+  margin-bottom:16px;
+}
+
+input:focus{
+  border-color:#00e5ff;
+  box-shadow:0 0 0 3px rgba(0,229,255,.08);
+}
+
+button{
+  width:100%;
+  padding:15px;
+  border:0;
+  border-radius:13px;
+  background:linear-gradient(135deg,#00e5ff,#7c4dff);
+  color:#fff;
+  font-size:15px;
+  font-weight:800;
+  cursor:pointer;
+}
+
+button:disabled{
+  opacity:.6;
+  cursor:not-allowed;
+}
+
+#error{
+  display:none;
+  margin-top:15px;
+  padding:12px;
+  border-radius:12px;
+  background:rgba(255,60,80,.08);
+  border:1px solid rgba(255,60,80,.25);
+  color:#ff8090;
+  font-size:13px;
+  text-align:center;
+}
+
+.footer{
+  margin-top:24px;
+  text-align:center;
+  color:#596173;
+  font-size:12px;
+}
+</style>
+</head>
+
+<body>
+
+<div class="login-box">
+
+  <div class="logo">TM</div>
+
+  <h1>TM Web Hosting</h1>
+
+  <div class="subtitle">
+    Secure Admin Dashboard
+  </div>
+
+  <form id="loginForm">
+
+    <label for="password">
+      Admin Password
+    </label>
+
+    <input
+      id="password"
+      type="password"
+      placeholder="Enter your password"
+      autocomplete="current-password"
+      required
+    >
+
+    <button id="loginBtn" type="submit">
+      Login
+    </button>
+
+  </form>
+
+  <div id="error"></div>
+
+  <div class="footer">
+    TM Web Hosting • Admin Access
+  </div>
+
+</div>
+
+<script>
+
+const form = document.getElementById("loginForm");
+const password = document.getElementById("password");
+const button = document.getElementById("loginBtn");
+const error = document.getElementById("error");
+
+form.addEventListener("submit", async e => {
+
+  e.preventDefault();
+
+  error.style.display = "none";
+
+  button.disabled = true;
+  button.textContent = "Logging in...";
+
+  try{
+
+    const response = await fetch("/api/auth/login",{
+      method:"POST",
+      headers:{
+        "Content-Type":"application/json"
+      },
+      body:JSON.stringify({
+        password:password.value
+      })
+    });
+
+    const data = await response.json();
+
+    if(!response.ok || !data.success){
+      throw new Error(
+        data.message || "Login failed"
+      );
+    }
+
+    window.location.href = "/";
+
+  }catch(err){
+
+    error.textContent = err.message;
+    error.style.display = "block";
+
+  }finally{
+
+    button.disabled = false;
+    button.textContent = "Login";
+
+  }
+
+});
+
+</script>
+
+</body>
+</html>
