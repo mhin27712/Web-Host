@@ -1,725 +1,988 @@
 const express = require("express");
+const session = require("express-session");
+const pgSession = require("connect-pg-simple")(session);
+const { Pool } = require("pg");
 const multer = require("multer");
-const fs = require("fs-extra");
-const path = require("path");
-const crypto = require("crypto");
 const AdmZip = require("adm-zip");
+const crypto = require("crypto");
+const path = require("path");
+const fs = require("fs");
+const https = require("https");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-const ROOT = __dirname;
-const PUBLIC_DIR = path.join(ROOT, "public");
-const SITES_DIR = path.join(ROOT, "sites");
-const TMP_DIR = path.join(ROOT, "tmp");
-const DB_FILE = path.join(ROOT, "sites.json");
+const PORT = process.env.PORT || 10000;
 
-const ADMIN_PASSWORD =
-  process.env.ADMIN_PASSWORD || "CHANGE_THIS_PASSWORD";
-
-const SESSION_SECRET =
-  process.env.SESSION_SECRET || "CHANGE_THIS_SESSION_SECRET";
-
-const MAX_UPLOAD_SIZE = 25 * 1024 * 1024;
-
-fs.ensureDirSync(PUBLIC_DIR);
-fs.ensureDirSync(SITES_DIR);
-fs.ensureDirSync(TMP_DIR);
-
-if (!fs.existsSync(DB_FILE)) {
-  fs.writeJsonSync(DB_FILE, [], { spaces: 2 });
+if (!process.env.DATABASE_URL) {
+  console.error("ERROR: DATABASE_URL is missing.");
+  process.exit(1);
 }
 
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true }));
+if (!process.env.GOOGLE_CLIENT_ID) {
+  console.error("ERROR: GOOGLE_CLIENT_ID is missing.");
+  process.exit(1);
+}
 
-const upload = multer({
-  dest: TMP_DIR,
-  limits: {
-    fileSize: MAX_UPLOAD_SIZE
-  }
+if (!process.env.GOOGLE_CLIENT_SECRET) {
+  console.error("ERROR: GOOGLE_CLIENT_SECRET is missing.");
+  process.exit(1);
+}
+
+if (!process.env.SESSION_SECRET) {
+  console.error("ERROR: SESSION_SECRET is missing.");
+  process.exit(1);
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === "production"
+    ? { rejectUnauthorized: false }
+    : false
 });
 
-/* =========================================================
-   DATABASE
-========================================================= */
+app.set("trust proxy", 1);
 
-function getSites() {
-  try {
-    return fs.readJsonSync(DB_FILE);
-  } catch {
-    return [];
-  }
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
+
+app.use(
+  session({
+    store: new pgSession({
+      pool,
+      tableName: "user_sessions",
+      createTableIfMissing: true
+    }),
+    secret: process.env.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    }
+  })
+);
+
+app.use(express.static(path.join(__dirname, "public")));
+
+// ----------------------------------------------------
+// Database
+// ----------------------------------------------------
+
+async function initDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      google_id TEXT UNIQUE NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      name TEXT,
+      picture TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS websites (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      slug TEXT UNIQUE NOT NULL,
+      type TEXT NOT NULL CHECK (type IN ('html', 'zip')),
+      html_content TEXT,
+      zip_data BYTEA,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  console.log("Database initialized.");
 }
 
-function saveSites(sites) {
-  fs.writeJsonSync(DB_FILE, sites, { spaces: 2 });
+// ----------------------------------------------------
+// Google OAuth helpers
+// ----------------------------------------------------
+
+function googleRequest(options, postData = null) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, (res) => {
+      let data = "";
+
+      res.on("data", (chunk) => {
+        data += chunk;
+      });
+
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(parsed);
+          } else {
+            reject(
+              new Error(
+                parsed.error_description ||
+                parsed.error ||
+                `Google API error: ${res.statusCode}`
+              )
+            );
+          }
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+
+    req.on("error", reject);
+
+    if (postData) {
+      req.write(postData);
+    }
+
+    req.end();
+  });
 }
 
-/* =========================================================
-   AUTH
-========================================================= */
-
-function createToken() {
-  return crypto
-    .createHmac("sha256", SESSION_SECRET)
-    .update("TM_WEB_HOSTING_AUTH")
-    .digest("hex");
+function base64UrlDecode(str) {
+  return Buffer.from(
+    str.replace(/-/g, "+").replace(/_/g, "/"),
+    "base64"
+  ).toString("utf8");
 }
 
-function isAuthenticated(req) {
-  const cookie = req.headers.cookie || "";
+// ----------------------------------------------------
+// Auth middleware
+// ----------------------------------------------------
 
-  const match = cookie
-    .split(";")
-    .map(v => v.trim())
-    .find(v => v.startsWith("tm_auth="));
-
-  if (!match) return false;
-
-  const token = match.substring("tm_auth=".length);
-
-  return token === createToken();
-}
-
-function requireAuth(req, res, next) {
-  if (!isAuthenticated(req)) {
+function requireLogin(req, res, next) {
+  if (!req.session.userId) {
     return res.status(401).json({
-      success: false,
-      message: "Unauthorized"
+      error: "You must login first."
     });
   }
 
   next();
 }
 
-/* =========================================================
-   AUTH API
-========================================================= */
+// ----------------------------------------------------
+// Google Login
+// ----------------------------------------------------
 
-app.post("/api/auth/login", (req, res) => {
-  const { password } = req.body;
+app.get("/api/auth/google", (req, res) => {
+  const state = crypto.randomBytes(32).toString("hex");
 
-  if (!password) {
-    return res.status(400).json({
-      success: false,
-      message: "Password required"
-    });
-  }
+  req.session.oauthState = state;
 
-  if (password !== ADMIN_PASSWORD) {
-    return res.status(401).json({
-      success: false,
-      message: "Wrong password"
-    });
-  }
-
-  res.setHeader(
-    "Set-Cookie",
-    `tm_auth=${createToken()}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800`
-  );
-
-  res.json({
-    success: true
+  const params = new URLSearchParams({
+    client_id: process.env.GOOGLE_CLIENT_ID,
+    redirect_uri: getRedirectUri(req),
+    response_type: "code",
+    scope: "openid email profile",
+    state,
+    access_type: "online",
+    prompt: "select_account"
   });
+
+  const googleUrl =
+    "https://accounts.google.com/o/oauth2/v2/auth?" +
+    params.toString();
+
+  res.redirect(googleUrl);
 });
+
+app.get("/api/auth/google/callback", async (req, res) => {
+  try {
+    const { code, state } = req.query;
+
+    if (!code) {
+      return res.status(400).send("Google authorization code missing.");
+    }
+
+    if (!state || state !== req.session.oauthState) {
+      return res.status(400).send("Invalid OAuth state.");
+    }
+
+    delete req.session.oauthState;
+
+    const redirectUri = getRedirectUri(req);
+
+    // Exchange authorization code for access token
+    const tokenParams = new URLSearchParams({
+      code,
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      redirect_uri: redirectUri,
+      grant_type: "authorization_code"
+    });
+
+    const tokenResponse = await googleRequest(
+      {
+        hostname: "oauth2.googleapis.com",
+        path: "/token",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Content-Length": Buffer.byteLength(tokenParams.toString())
+        }
+      },
+      tokenParams.toString()
+    );
+
+    if (!tokenResponse.access_token) {
+      throw new Error("Google access token not received.");
+    }
+
+    // Get Google user information
+    const userInfo = await googleRequest({
+      hostname: "openidconnect.googleapis.com",
+      path: "/v1/userinfo",
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${tokenResponse.access_token}`
+      }
+    });
+
+    if (!userInfo.sub || !userInfo.email) {
+      throw new Error("Google account information incomplete.");
+    }
+
+    if (userInfo.email_verified !== true) {
+      throw new Error("Google email is not verified.");
+    }
+
+    // Create/update user
+    const result = await pool.query(
+      `
+      INSERT INTO users
+        (google_id, email, name, picture)
+      VALUES
+        ($1, $2, $3, $4)
+      ON CONFLICT (google_id)
+      DO UPDATE SET
+        email = EXCLUDED.email,
+        name = EXCLUDED.name,
+        picture = EXCLUDED.picture
+      RETURNING id, email, name, picture
+      `,
+      [
+        userInfo.sub,
+        userInfo.email.toLowerCase(),
+        userInfo.name || "",
+        userInfo.picture || ""
+      ]
+    );
+
+    const user = result.rows[0];
+
+    req.session.userId = user.id;
+    req.session.userEmail = user.email;
+
+    req.session.save((err) => {
+      if (err) {
+        console.error(err);
+        return res.status(500).send("Could not create session.");
+      }
+
+      res.redirect("/dashboard.html");
+    });
+
+  } catch (error) {
+    console.error("Google login error:", error);
+    res.status(500).send(
+      "Google login failed. Please try again."
+    );
+  }
+});
+
+function getRedirectUri(req) {
+  if (process.env.GOOGLE_REDIRECT_URI) {
+    return process.env.GOOGLE_REDIRECT_URI;
+  }
+
+  const protocol =
+    process.env.NODE_ENV === "production"
+      ? "https"
+      : req.protocol;
+
+  return `${protocol}://${req.get("host")}/api/auth/google/callback`;
+}
+
+// ----------------------------------------------------
+// Logout
+// ----------------------------------------------------
 
 app.post("/api/auth/logout", (req, res) => {
-  res.setHeader(
-    "Set-Cookie",
-    "tm_auth=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0"
-  );
-
-  res.json({
-    success: true
+  req.session.destroy(() => {
+    res.json({
+      success: true
+    });
   });
 });
 
-app.get("/api/auth/me", (req, res) => {
-  res.json({
-    authenticated: isAuthenticated(req)
-  });
-});
+// ----------------------------------------------------
+// Current user
+// ----------------------------------------------------
 
-/* =========================================================
-   DASHBOARD
-========================================================= */
+app.get("/api/me", requireLogin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT id, email, name, picture, created_at
+      FROM users
+      WHERE id = $1
+      `,
+      [req.session.userId]
+    );
 
-app.get("/", (req, res) => {
-  if (!isAuthenticated(req)) {
-    return res.sendFile(path.join(PUBLIC_DIR, "login.html"));
+    if (result.rows.length === 0) {
+      req.session.destroy(() => {});
+      return res.status(401).json({
+        error: "User not found."
+      });
+    }
+
+    res.json(result.rows[0]);
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: "Server error."
+    });
   }
-
-  res.sendFile(path.join(PUBLIC_DIR, "index.html"));
 });
 
-/* =========================================================
-   SITE HELPERS
-========================================================= */
+// ----------------------------------------------------
+// Generate unique slug
+// ----------------------------------------------------
 
-function generateId() {
-  return crypto.randomBytes(8).toString("hex");
-}
-
-function cleanSlug(value) {
-  return String(value || "")
+async function generateSlug(name) {
+  let base = String(name)
     .toLowerCase()
     .trim()
-    .replace(/[^a-z0-9-_]+/g, "-")
+    .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
-    .substring(0, 60);
-}
+    .substring(0, 35);
 
-function slugExists(slug, ignoreId = null) {
-  return getSites().some(
-    site => site.slug === slug && site.id !== ignoreId
-  );
-}
-
-function uniqueSlug(base, ignoreId = null) {
-  let slug = cleanSlug(base) || "website";
-  let original = slug;
-  let counter = 1;
-
-  while (slugExists(slug, ignoreId)) {
-    slug = `${original}-${counter}`;
-    counter++;
+  if (!base) {
+    base = "website";
   }
 
-  return slug;
-}
+  let slug = base;
 
-function findIndexHtml(dir) {
-  const direct = path.join(dir, "index.html");
+  for (let i = 0; i < 20; i++) {
+    const result = await pool.query(
+      "SELECT id FROM websites WHERE slug = $1",
+      [slug]
+    );
 
-  if (fs.existsSync(direct)) {
-    return direct;
-  }
-
-  const entries = fs.readdirSync(dir, {
-    withFileTypes: true
-  });
-
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-
-    const candidate = path.join(dir, entry.name, "index.html");
-
-    if (fs.existsSync(candidate)) {
-      return candidate;
+    if (result.rows.length === 0) {
+      return slug;
     }
+
+    slug =
+      base +
+      "-" +
+      crypto.randomBytes(3).toString("hex");
   }
 
-  return null;
+  throw new Error("Could not generate unique website URL.");
 }
 
-function copyDirectoryContents(source, destination) {
-  fs.ensureDirSync(destination);
+// ----------------------------------------------------
+// List user's websites
+// ----------------------------------------------------
 
-  for (const item of fs.readdirSync(source, {
-    withFileTypes: true
-  })) {
-    const src = path.join(source, item.name);
-    const dest = path.join(destination, item.name);
-
-    if (item.isDirectory()) {
-      fs.copySync(src, dest);
-    } else {
-      fs.copyFileSync(src, dest);
-    }
-  }
-}
-
-/* =========================================================
-   GET WEBSITES
-========================================================= */
-
-app.get("/api/sites", requireAuth, (req, res) => {
-  const sites = getSites();
-
-  const result = sites.map(site => ({
-    id: site.id,
-    name: site.name,
-    slug: site.slug,
-    url: `/site/${site.slug}`,
-    createdAt: site.createdAt,
-    updatedAt: site.updatedAt,
-    type: site.type
-  }));
-
-  res.json({
-    success: true,
-    sites: result
-  });
-});
-
-/* =========================================================
-   CREATE WEBSITE
-========================================================= */
-
-app.post(
-  "/api/sites",
-  requireAuth,
-  upload.single("website"),
-  async (req, res) => {
-    let uploadedFile = null;
-
-    try {
-      const name = String(req.body.name || "").trim();
-      const requestedSlug = String(req.body.slug || "").trim();
-      const htmlCode = String(req.body.htmlCode || "").trim();
-
-      uploadedFile = req.file;
-
-      if (!name) {
-        return res.status(400).json({
-          success: false,
-          message: "Website name is required"
-        });
-      }
-
-      if (!htmlCode && !uploadedFile) {
-        return res.status(400).json({
-          success: false,
-          message: "HTML code or ZIP file is required"
-        });
-      }
-
-      if (htmlCode && uploadedFile) {
-        return res.status(400).json({
-          success: false,
-          message: "Use either HTML code or ZIP upload, not both"
-        });
-      }
-
-      const id = generateId();
-      const slug = uniqueSlug(requestedSlug || name);
-
-      const siteDir = path.join(SITES_DIR, id);
-
-      await fs.ensureDir(siteDir);
-
-      if (htmlCode) {
-        await fs.writeFile(
-          path.join(siteDir, "index.html"),
-          htmlCode,
-          "utf8"
-        );
-      }
-
-      if (uploadedFile) {
-        const zip = new AdmZip(uploadedFile.path);
-
-        const tempExtract = path.join(
-          TMP_DIR,
-          `extract-${id}`
-        );
-
-        await fs.ensureDir(tempExtract);
-
-        zip.extractAllTo(tempExtract, true);
-
-        const indexFile = findIndexHtml(tempExtract);
-
-        if (!indexFile) {
-          await fs.remove(siteDir);
-          await fs.remove(tempExtract);
-
-          return res.status(400).json({
-            success: false,
-            message: "ZIP file must contain index.html"
-          });
-        }
-
-        const rootFolder = path.dirname(indexFile);
-
-        copyDirectoryContents(rootFolder, siteDir);
-
-        await fs.remove(tempExtract);
-      }
-
-      const now = new Date().toISOString();
-
-      const site = {
+app.get("/api/websites", requireLogin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
         id,
         name,
         slug,
-        type: htmlCode ? "html" : "zip",
-        createdAt: now,
-        updatedAt: now
-      };
-
-      const sites = getSites();
-
-      sites.unshift(site);
-
-      saveSites(sites);
-
-      res.json({
-        success: true,
-        message: "Website published successfully",
-        site: {
-          ...site,
-          url: `/site/${slug}`
-        }
-      });
-    } catch (error) {
-      console.error(error);
-
-      res.status(500).json({
-        success: false,
-        message: "Failed to publish website"
-      });
-    } finally {
-      if (uploadedFile?.path) {
-        await fs.remove(uploadedFile.path).catch(() => {});
-      }
-    }
-  }
-);
-
-/* =========================================================
-   GET SINGLE WEBSITE
-========================================================= */
-
-app.get("/api/sites/:id", requireAuth, (req, res) => {
-  const sites = getSites();
-
-  const site = sites.find(
-    item => item.id === req.params.id
-  );
-
-  if (!site) {
-    return res.status(404).json({
-      success: false,
-      message: "Website not found"
-    });
-  }
-
-  const siteDir = path.join(SITES_DIR, site.id);
-  const indexFile = path.join(siteDir, "index.html");
-
-  let html = "";
-
-  if (fs.existsSync(indexFile)) {
-    html = fs.readFileSync(indexFile, "utf8");
-  }
-
-  res.json({
-    success: true,
-    site: {
-      ...site,
-      htmlCode: html
-    }
-  });
-});
-
-/* =========================================================
-   UPDATE WEBSITE
-========================================================= */
-
-app.put(
-  "/api/sites/:id",
-  requireAuth,
-  upload.single("website"),
-  async (req, res) => {
-    let uploadedFile = null;
-
-    try {
-      const sites = getSites();
-
-      const index = sites.findIndex(
-        site => site.id === req.params.id
-      );
-
-      if (index === -1) {
-        return res.status(404).json({
-          success: false,
-          message: "Website not found"
-        });
-      }
-
-      const site = sites[index];
-
-      const name =
-        String(req.body.name || site.name).trim();
-
-      const requestedSlug =
-        String(req.body.slug || site.slug).trim();
-
-      const htmlCode =
-        String(req.body.htmlCode || "").trim();
-
-      uploadedFile = req.file;
-
-      if (htmlCode && uploadedFile) {
-        return res.status(400).json({
-          success: false,
-          message: "Use either HTML code or ZIP upload"
-        });
-      }
-
-      if (!htmlCode && !uploadedFile) {
-        return res.status(400).json({
-          success: false,
-          message: "HTML code or ZIP file is required"
-        });
-      }
-
-      const newSlug = uniqueSlug(
-        requestedSlug || site.slug,
-        site.id
-      );
-
-      const siteDir = path.join(SITES_DIR, site.id);
-
-      await fs.remove(siteDir);
-      await fs.ensureDir(siteDir);
-
-      if (htmlCode) {
-        await fs.writeFile(
-          path.join(siteDir, "index.html"),
-          htmlCode,
-          "utf8"
-        );
-
-        site.type = "html";
-      }
-
-      if (uploadedFile) {
-        const zip = new AdmZip(uploadedFile.path);
-
-        const tempExtract = path.join(
-          TMP_DIR,
-          `update-${site.id}`
-        );
-
-        await fs.ensureDir(tempExtract);
-
-        zip.extractAllTo(tempExtract, true);
-
-        const indexFile = findIndexHtml(tempExtract);
-
-        if (!indexFile) {
-          await fs.remove(tempExtract);
-
-          return res.status(400).json({
-            success: false,
-            message: "ZIP file must contain index.html"
-          });
-        }
-
-        const rootFolder = path.dirname(indexFile);
-
-        copyDirectoryContents(rootFolder, siteDir);
-
-        await fs.remove(tempExtract);
-
-        site.type = "zip";
-      }
-
-      site.name = name;
-      site.slug = newSlug;
-      site.updatedAt = new Date().toISOString();
-
-      sites[index] = site;
-
-      saveSites(sites);
-
-      res.json({
-        success: true,
-        message: "Website updated successfully",
-        site: {
-          ...site,
-          url: `/site/${site.slug}`
-        }
-      });
-    } catch (error) {
-      console.error(error);
-
-      res.status(500).json({
-        success: false,
-        message: "Failed to update website"
-      });
-    } finally {
-      if (uploadedFile?.path) {
-        await fs.remove(uploadedFile.path).catch(() => {});
-      }
-    }
-  }
-);
-
-/* =========================================================
-   DELETE WEBSITE
-========================================================= */
-
-app.delete("/api/sites/:id", requireAuth, async (req, res) => {
-  try {
-    const sites = getSites();
-
-    const index = sites.findIndex(
-      site => site.id === req.params.id
+        type,
+        created_at,
+        updated_at
+      FROM websites
+      WHERE user_id = $1
+      ORDER BY created_at DESC
+      `,
+      [req.session.userId]
     );
 
-    if (index === -1) {
-      return res.status(404).json({
-        success: false,
-        message: "Website not found"
-      });
-    }
+    res.json(result.rows);
 
-    const site = sites[index];
-
-    const siteDir = path.join(SITES_DIR, site.id);
-
-    await fs.remove(siteDir);
-
-    sites.splice(index, 1);
-
-    saveSites(sites);
-
-    res.json({
-      success: true,
-      message: "Website deleted successfully"
-    });
   } catch (error) {
     console.error(error);
 
     res.status(500).json({
-      success: false,
-      message: "Failed to delete website"
+      error: "Could not load websites."
     });
   }
 });
 
-/* =========================================================
-   PUBLIC WEBSITE HOSTING
-========================================================= */
+// ----------------------------------------------------
+// Create HTML website
+// ----------------------------------------------------
 
-app.get("/site/:slug", serveWebsite);
-app.get("/site/:slug/*splat", serveWebsite);
+app.post("/api/websites/html", requireLogin, async (req, res) => {
+  try {
+    const { name, html } = req.body;
 
-function serveWebsite(req, res) {
-  const slug = req.params.slug;
+    if (!name || !html) {
+      return res.status(400).json({
+        error: "Website name and HTML are required."
+      });
+    }
 
-  const sites = getSites();
+    if (Buffer.byteLength(html, "utf8") > 1024 * 1024 * 2) {
+      return res.status(400).json({
+        error: "HTML file is too large. Maximum 2MB."
+      });
+    }
 
-  const site = sites.find(
-    item => item.slug === slug
-  );
+    const slug = await generateSlug(name);
 
-  if (!site) {
-    return res.status(404).send(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="UTF-8">
-        <title>Website Not Found</title>
-        <style>
-          body{
-            margin:0;
-            background:#08090d;
-            color:#fff;
-            font-family:Arial,sans-serif;
-            display:flex;
-            align-items:center;
-            justify-content:center;
-            min-height:100vh;
-            text-align:center;
+    const result = await pool.query(
+      `
+      INSERT INTO websites
+        (user_id, name, slug, type, html_content)
+      VALUES
+        ($1, $2, $3, 'html', $4)
+      RETURNING id, name, slug, type
+      `,
+      [
+        req.session.userId,
+        name.trim(),
+        slug,
+        html
+      ]
+    );
+
+    res.json({
+      success: true,
+      website: result.rows[0],
+      url: `/site/${slug}`
+    });
+
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      error: "Could not create website."
+    });
+  }
+});
+
+// ----------------------------------------------------
+// ZIP upload
+// ----------------------------------------------------
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024
+  },
+  fileFilter: (req, file, cb) => {
+    const allowed = [
+      "application/zip",
+      "application/x-zip-compressed",
+      "application/octet-stream"
+    ];
+
+    if (
+      allowed.includes(file.mimetype) ||
+      file.originalname.toLowerCase().endsWith(".zip")
+    ) {
+      cb(null, true);
+    } else {
+      cb(new Error("Only ZIP files are allowed."));
+    }
+  }
+});
+
+app.post(
+  "/api/websites/zip",
+  requireLogin,
+  upload.single("website"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({
+          error: "ZIP file is required."
+        });
+      }
+
+      const { name } = req.body;
+
+      if (!name) {
+        return res.status(400).json({
+          error: "Website name is required."
+        });
+      }
+
+      // Validate ZIP
+      const zip = new AdmZip(req.file.buffer);
+      const entries = zip.getEntries();
+
+      if (entries.length === 0) {
+        return res.status(400).json({
+          error: "ZIP file is empty."
+        });
+      }
+
+      if (entries.length > 1000) {
+        return res.status(400).json({
+          error: "ZIP contains too many files."
+        });
+      }
+
+      let totalUncompressed = 0;
+      let hasIndex = false;
+
+      for (const entry of entries) {
+        const entryName = entry.entryName.replace(/\\/g, "/");
+
+        // Prevent path traversal
+        if (
+          entryName.startsWith("/") ||
+          entryName.includes("../") ||
+          entryName.includes("..\\")
+        ) {
+          return res.status(400).json({
+            error: "Unsafe ZIP file path detected."
+          });
+        }
+
+        if (!entry.isDirectory) {
+          totalUncompressed += entry.header.size;
+
+          if (
+            entryName === "index.html" ||
+            entryName === "index.htm"
+          ) {
+            hasIndex = true;
           }
-          h1{font-size:42px}
-          p{color:#aaa}
-        </style>
-      </head>
-      <body>
-        <div>
-          <h1>404</h1>
-          <p>Website not found.</p>
-        </div>
-      </body>
-      </html>
-    `);
+        }
+      }
+
+      // Protect against huge extracted ZIPs
+      if (totalUncompressed > 50 * 1024 * 1024) {
+        return res.status(400).json({
+          error: "ZIP extracted size cannot exceed 50MB."
+        });
+      }
+
+      if (!hasIndex) {
+        return res.status(400).json({
+          error: "ZIP must contain index.html."
+        });
+      }
+
+      const slug = await generateSlug(name);
+
+      const result = await pool.query(
+        `
+        INSERT INTO websites
+          (user_id, name, slug, type, zip_data)
+        VALUES
+          ($1, $2, $3, 'zip', $4)
+        RETURNING id, name, slug, type
+        `,
+        [
+          req.session.userId,
+          name.trim(),
+          slug,
+          req.file.buffer
+        ]
+      );
+
+      res.json({
+        success: true,
+        website: result.rows[0],
+        url: `/site/${slug}`
+      });
+
+    } catch (error) {
+      console.error(error);
+
+      res.status(400).json({
+        error:
+          error.message ||
+          "Could not process ZIP file."
+      });
+    }
   }
+);
 
-  const siteDir = path.join(SITES_DIR, site.id);
+// ----------------------------------------------------
+// Delete website
+// ----------------------------------------------------
 
-  let requestedPath = req.path;
+app.delete(
+  "/api/websites/:id",
+  requireLogin,
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `
+        DELETE FROM websites
+        WHERE id = $1
+        AND user_id = $2
+        RETURNING id
+        `,
+        [
+          req.params.id,
+          req.session.userId
+        ]
+      );
 
-  const prefix = `/site/${slug}`;
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          error: "Website not found or not owned by you."
+        });
+      }
 
-  if (requestedPath.startsWith(prefix)) {
-    requestedPath = requestedPath.substring(prefix.length);
+      res.json({
+        success: true
+      });
+
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error: "Could not delete website."
+      });
+    }
   }
+);
 
-  if (!requestedPath || requestedPath === "/") {
-    requestedPath = "/index.html";
+// ----------------------------------------------------
+// Get website details for owner
+// ----------------------------------------------------
+
+app.get(
+  "/api/websites/:id",
+  requireLogin,
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `
+        SELECT
+          id,
+          name,
+          slug,
+          type,
+          html_content,
+          created_at,
+          updated_at
+        FROM websites
+        WHERE id = $1
+        AND user_id = $2
+        `,
+        [
+          req.params.id,
+          req.session.userId
+        ]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          error: "Website not found."
+        });
+      }
+
+      res.json(result.rows[0]);
+
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error: "Could not load website."
+      });
+    }
   }
+);
 
-  const cleanPath = path
-    .normalize(requestedPath)
-    .replace(/^(\.\.(\/|\\|$))+/, "");
+// ----------------------------------------------------
+// Update HTML website
+// ----------------------------------------------------
 
-  const filePath = path.join(
-    siteDir,
-    cleanPath
-  );
+app.put(
+  "/api/websites/:id/html",
+  requireLogin,
+  async (req, res) => {
+    try {
+      const { name, html } = req.body;
 
-  if (
-    !filePath.startsWith(
-      path.resolve(siteDir)
-    )
-  ) {
-    return res.status(403).send("Forbidden");
+      if (!name || !html) {
+        return res.status(400).json({
+          error: "Website name and HTML are required."
+        });
+      }
+
+      if (Buffer.byteLength(html, "utf8") > 1024 * 1024 * 2) {
+        return res.status(400).json({
+          error: "HTML cannot exceed 2MB."
+        });
+      }
+
+      const result = await pool.query(
+        `
+        UPDATE websites
+        SET
+          name = $1,
+          html_content = $2,
+          updated_at = NOW()
+        WHERE id = $3
+        AND user_id = $4
+        AND type = 'html'
+        RETURNING id, name, slug, type
+        `,
+        [
+          name.trim(),
+          html,
+          req.params.id,
+          req.session.userId
+        ]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          error: "Website not found."
+        });
+      }
+
+      res.json({
+        success: true,
+        website: result.rows[0]
+      });
+
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error: "Could not update website."
+      });
+    }
   }
+);
 
-  if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-    return res.sendFile(filePath);
+// ----------------------------------------------------
+// Public website
+// ----------------------------------------------------
+
+app.get("/site/:slug", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM websites
+      WHERE slug = $1
+      `,
+      [req.params.slug]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).send("Website not found.");
+    }
+
+    const site = result.rows[0];
+
+    if (site.type === "html") {
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      return res.send(site.html_content || "");
+    }
+
+    if (site.type === "zip") {
+      return serveZipWebsite(site, req, res);
+    }
+
+    res.status(500).send("Unknown website type.");
+
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).send(
+      "Could not load website."
+    );
   }
+});
 
-  const indexFile = path.join(
-    siteDir,
-    "index.html"
-  );
+// ----------------------------------------------------
+// ZIP website file serving
+// ----------------------------------------------------
 
-  if (fs.existsSync(indexFile)) {
-    return res.sendFile(indexFile);
+function serveZipWebsite(site, req, res) {
+  try {
+    const zip = new AdmZip(site.zip_data);
+
+    let requestedPath = req.path;
+
+    // req.path for /site/slug is "/"
+    // For nested files Express route is handled separately below.
+    if (
+      !requestedPath ||
+      requestedPath === "/" ||
+      requestedPath === ""
+    ) {
+      requestedPath = "/index.html";
+    }
+
+    requestedPath = decodeURIComponent(requestedPath)
+      .replace(/^\/+/, "")
+      .replace(/\\/g, "/");
+
+    if (
+      requestedPath.includes("../") ||
+      requestedPath.includes("..\\") ||
+      requestedPath.startsWith("..")
+    ) {
+      return res.status(400).send("Invalid path.");
+    }
+
+    const entry = zip.getEntry(requestedPath);
+
+    if (!entry || entry.isDirectory) {
+      return res.status(404).send("File not found.");
+    }
+
+    const data = entry.getData();
+
+    const mime = getMimeType(requestedPath);
+
+    res.setHeader("Content-Type", mime);
+    res.setHeader("Cache-Control", "public, max-age=300");
+
+    return res.send(data);
+
+  } catch (error) {
+    console.error(error);
+
+    return res.status(500).send(
+      "Could not load website file."
+    );
   }
-
-  res.status(404).send("File not found");
 }
 
-/* =========================================================
-   STATIC DASHBOARD FILES
-========================================================= */
+// ----------------------------------------------------
+// ZIP nested file route
+// ----------------------------------------------------
 
-app.use(express.static(PUBLIC_DIR));
+app.get("/site/:slug/*splat", async (req, res) => {
+  try {
+    const slug = req.params.slug;
 
-/* =========================================================
-   ERROR HANDLER
-========================================================= */
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM websites
+      WHERE slug = $1
+      `,
+      [slug]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).send("Website not found.");
+    }
+
+    const site = result.rows[0];
+
+    if (site.type !== "zip") {
+      return res.status(404).send("File not found.");
+    }
+
+    let splat = req.params.splat;
+
+    if (Array.isArray(splat)) {
+      splat = splat.join("/");
+    }
+
+    splat = "/" + (splat || "");
+
+    // Re-use ZIP serving logic
+    req.path = splat;
+
+    return serveZipWebsite(site, req, res);
+
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).send(
+      "Could not load website file."
+    );
+  }
+});
+
+// ----------------------------------------------------
+// MIME types
+// ----------------------------------------------------
+
+function getMimeType(filename) {
+  const ext = path.extname(filename).toLowerCase();
+
+  const mimeTypes = {
+    ".html": "text/html; charset=utf-8",
+    ".htm": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".mjs": "application/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".xml": "application/xml; charset=utf-8",
+    ".txt": "text/plain; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".ico": "image/x-icon",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".mp3": "audio/mpeg",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm"
+  };
+
+  return mimeTypes[ext] || "application/octet-stream";
+}
+
+// ----------------------------------------------------
+// Error handler
+// ----------------------------------------------------
 
 app.use((err, req, res, next) => {
   console.error(err);
 
-  if (err.code === "LIMIT_FILE_SIZE") {
+  if (err instanceof multer.MulterError) {
     return res.status(400).json({
-      success: false,
-      message: "ZIP file is too large. Maximum 25MB."
+      error: `Upload error: ${err.message}`
     });
   }
 
   res.status(500).json({
-    success: false,
-    message: "Internal server error"
+    error: err.message || "Internal server error."
   });
 });
 
-/* =========================================================
-   START SERVER
-========================================================= */
+// ----------------------------------------------------
+// Start server
+// ----------------------------------------------------
 
-app.listen(PORT, () => {
-  console.log(
-    `TM Web Hosting running on port ${PORT}`
-  );
-});
+initDatabase()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(
+        `TM Web Hosting running on port ${PORT}`
+      );
+    });
+  })
+  .catch((error) => {
+    console.error(
+      "Database initialization failed:",
+      error
+    );
+
+    process.exit(1);
+  });
